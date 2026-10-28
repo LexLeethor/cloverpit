@@ -1,0 +1,890 @@
+<!DOCTYPE html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <title>Unity Web Player | CloverPit</title>
+    <link rel="shortcut icon" href="TemplateData/favicon.ico">
+    <link rel="stylesheet" href="TemplateData/style.css">
+  </head>
+  <body>
+    <div id="unity-container">
+      <canvas id="unity-canvas" width="960" height="540" tabindex="-1"></canvas>
+      <div id="unity-loading-bar">
+        <div id="unity-logo"></div>
+        <div id="unity-progress-bar-empty">
+          <div id="unity-progress-bar-full"></div>
+        </div>
+      </div>
+      <div id="unity-warning"></div>
+    </div>
+    <script>
+      var container = document.querySelector("#unity-container");
+      var canvas = document.querySelector("#unity-canvas");
+      var loadingBar = document.querySelector("#unity-loading-bar");
+      var progressBarFull = document.querySelector("#unity-progress-bar-full");
+      var warningBanner = document.querySelector("#unity-warning");
+
+      function unityShowBanner(msg, type) {
+        // Intentionally left minimal
+      }
+
+      const qs = new URLSearchParams(location.search);
+      const safeMode = qs.has('safe') || qs.get('safe') === '1';
+
+      var buildUrl = "Build";
+      var loaderUrl = buildUrl + "/CloverPit.loader.js";
+      var config = {
+        arguments: [],
+        dataUrl: buildUrl + "/CloverPit.data",
+        frameworkUrl: buildUrl + "/CloverPit.framework.js",
+        codeUrl: buildUrl + "/CloverPit.wasm",
+        streamingAssetsUrl: "/idbfs/StreamingAssets",
+        companyName: "Panik Arcade",
+        productName: "CloverPit",
+        productVersion: "1.3",
+        showBanner: unityShowBanner,
+        autoSyncPersistentDataPath: true,
+      };
+
+      if (safeMode) {
+        console.warn('[safeMode] enabled');
+        config.matchWebGLToCanvasSize = false;
+        config.devicePixelRatio = 1;
+        config.webglContextAttributes = {
+          alpha: false,
+          antialias: false,
+          depth: true,
+          stencil: false,
+          preserveDrawingBuffer: false,
+          powerPreference: "low-power",
+          failIfMajorPerformanceCaveat: true
+        };
+        canvas.width = 640;
+        canvas.height = 360;
+      }
+
+      if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
+        var meta = document.createElement('meta');
+        meta.name = 'viewport';
+        meta.content = 'width=device-width, height=device-height, initial-scale=1.0, user-scalable=no, shrink-to-fit=yes';
+        document.getElementsByTagName('head')[0].appendChild(meta);
+      }
+
+      loadingBar.style.display = "block";
+
+      var script = document.createElement("script");
+      script.src = loaderUrl;
+      const ENABLE_SAVE_TRACE = false;
+
+      // ─── EARLY SHIM ───────────────────────────────────────────────────────────
+      // Patches the IDBFS DB name so Unity's autoSyncPersistentDataPath initial
+      // syncfs(true) reads from the right database.
+      //
+      // ROOT CAUSE from logs: "[saveShim] IDBFS DB name set to CloverPitSave" fires
+      // AFTER "[unityDebug] FS logger installed", meaning the interval-based patch
+      // landed ~1 second late. Unity's autoSyncPersistentDataPath already ran its
+      // initial syncfs(true) against the wrong/default DB (empty), found no saves,
+      // and booted a NEW game. The game writes fresh saves — overwriting the real ones.
+      //
+      // FIX: Intercept window.IDBFS via Object.defineProperty so patchTarget fires
+      // THE INSTANT Unity's module assigns it — synchronously, before any getDB call.
+      (function installEarlySaveShim() {
+        if (window.__saveShimInstalled) return;
+        window.__saveShimInstalled = true;
+
+        const IDBFS_DB_NAME = 'CloverPitSave';
+        window.__idbfsDbName = IDBFS_DB_NAME;
+
+        const patchTarget = (idbfs) => {
+          if (!idbfs || typeof idbfs.getDB !== 'function') return false;
+          if (idbfs.__cbgamesDbPatched) return true;
+          const originalGetDB = idbfs.getDB.bind(idbfs);
+          idbfs.getDB = function(name, callback) {
+            const resolvedName = (name === '/idbfs' || name === 'IDBFS') ? IDBFS_DB_NAME : name;
+            return originalGetDB(resolvedName, callback);
+          };
+          idbfs.__cbgamesDbPatched = true;
+          idbfs.__cbgamesDbName = IDBFS_DB_NAME;
+          console.log('[saveShim] IDBFS DB name patched to', IDBFS_DB_NAME);
+          return true;
+        };
+
+        // Intercept window.IDBFS the instant Unity's module sets it.
+        // This is synchronous and beats any subsequent getDB() call.
+        let _idbfsValue = window.IDBFS;
+        try {
+          Object.defineProperty(window, 'IDBFS', {
+            configurable: true,
+            enumerable: true,
+            get() { return _idbfsValue; },
+            set(val) {
+              _idbfsValue = val;
+              patchTarget(val);
+            }
+          });
+          if (_idbfsValue) patchTarget(_idbfsValue);
+        } catch (e) {
+          // defineProperty blocked — fall through to polling fallback
+          console.warn('[saveShim] defineProperty on IDBFS unavailable, using polling', e);
+          if (_idbfsValue) patchTarget(_idbfsValue);
+        }
+
+        // Also patch via Module.FS.filesystems.IDBFS (some Unity versions only
+        // expose it through the module, not window.IDBFS).
+        const patchModuleIdbfs = () => {
+          try {
+            const mod = window.Module || (window.unityInstance && window.unityInstance.Module) || null;
+            const fsIdbfs = mod && mod.FS && mod.FS.filesystems && mod.FS.filesystems.IDBFS;
+            return patchTarget(fsIdbfs);
+          } catch (e) { return false; }
+        };
+
+        // preRun hook: one more patch opportunity right before module init.
+        const preRunPatch = () => {
+          patchTarget(window.IDBFS);
+          patchModuleIdbfs();
+        };
+        if (Array.isArray(config.preRun)) {
+          config.preRun.unshift(preRunPatch);
+        } else {
+          config.preRun = [preRunPatch];
+        }
+
+        // Belt-and-suspenders polling fallback at 100ms (faster than original 250ms).
+        let idbfsPatchTries = 0;
+        const idbfsPatchInterval = setInterval(() => {
+          idbfsPatchTries += 1;
+          if ((patchTarget(window.IDBFS) || patchModuleIdbfs()) || idbfsPatchTries >= 60) {
+            clearInterval(idbfsPatchInterval);
+          }
+        }, 100);
+      })();
+      // ─── END EARLY SHIM ───────────────────────────────────────────────────────
+
+      script.onload = () => {
+        // Block unwanted popups
+        const _open = window.open;
+        window.open = function(url, name, features) {
+          try {
+            const u = String(url || "");
+            if (!u || u === "about:blank" || u.includes("cloverpit.ateo.ch")) {
+              console.warn("[popup-block] blocked", u);
+              return null;
+            }
+          } catch (e) {}
+          return _open.call(window, url, name, features);
+        };
+
+        createUnityInstance(canvas, config, (progress) => {
+          progressBarFull.style.width = 100 * progress + "%";
+        }).then((unityInstance) => {
+          loadingBar.style.display = "none";
+
+          window.unityInstance = unityInstance;
+          window.unityDebug = {
+            getModule: () => {
+              const mod = (unityInstance && unityInstance.Module) || window.Module || null;
+              if (!mod) {
+                console.warn('[unityDebug] Module not found yet');
+                return null;
+              }
+              if (!window.Module) window.Module = mod;
+              return mod;
+            },
+            getFS: () => {
+              const mod = window.unityDebug.getModule();
+              const fs = (mod && mod.FS) || window.FS || null;
+              if (!fs) {
+                console.warn('[unityDebug] FS not exported by this build');
+                return null;
+              }
+              return fs;
+            },
+            syncPersistent: () => new Promise((resolve, reject) => {
+              try {
+                const FS = window.unityDebug.getFS();
+                if (!FS || typeof FS.syncfs !== 'function') {
+                  console.warn('[unityDebug] FS.syncfs not available yet');
+                  resolve();
+                  return;
+                }
+                FS.syncfs(false, (err) => {
+                  if (err) {
+                    console.error('[unityDebug] syncfs error', err);
+                    reject(err);
+                  } else {
+                    console.log('[unityDebug] syncfs ok');
+                    resolve();
+                  }
+                });
+              } catch (e) {
+                console.error('[unityDebug] syncfs exception', e);
+                reject(e);
+              }
+            }),
+            listPersistent: () => {
+              try {
+                const FS = window.unityDebug.getFS();
+                if (!FS) return [];
+                const walk = (dir) => {
+                  const out = [];
+                  const entries = FS.readdir(dir);
+                  for (const name of entries) {
+                    if (name === '.' || name === '..') continue;
+                    const full = dir === '/' ? `/${name}` : `${dir}/${name}`;
+                    const stat = FS.stat(full);
+                    if (FS.isDir(stat.mode)) out.push(...walk(full));
+                    else out.push(full);
+                  }
+                  return out;
+                };
+                const files = walk('/idbfs');
+                console.log('[unityDebug] /idbfs files', files);
+                return files;
+              } catch (e) {
+                console.error('[unityDebug] listPersistent exception', e);
+                return [];
+              }
+            },
+            statPersistent: () => {
+              const FS = window.unityDebug.getFS();
+              if (!FS) return [];
+              const walk = (dir) => {
+                const out = [];
+                const entries = FS.readdir(dir);
+                for (const name of entries) {
+                  if (name === '.' || name === '..') continue;
+                  const full = dir === '/' ? `/${name}` : `${dir}/${name}`;
+                  const stat = FS.stat(full);
+                  if (FS.isDir(stat.mode)) out.push(...walk(full));
+                  else out.push({ path: full, size: stat.size, mtime: stat.mtime });
+                }
+                return out;
+              };
+              const files = walk('/idbfs');
+              console.log('[unityDebug] /idbfs stats', files);
+              return files;
+            },
+            readPlayerPrefs: () => {
+              const FS = window.unityDebug.getFS();
+              if (!FS) return null;
+              const files = window.unityDebug.listPersistent();
+              const prefs = files.find(p => p.endsWith('/PlayerPrefs'));
+              if (!prefs) {
+                console.warn('[unityDebug] PlayerPrefs file not found');
+                return null;
+              }
+              try {
+                const data = FS.readFile(prefs, { encoding: 'binary' });
+                const bytes = new Uint8Array(data);
+                const preview = Array.from(bytes.slice(0, 256))
+                  .map(b => b.toString(16).padStart(2, '0'))
+                  .join(' ');
+                console.log(`[unityDebug] PlayerPrefs size ${bytes.length} bytes`);
+                console.log('[unityDebug] PlayerPrefs hex preview', preview);
+                return bytes;
+              } catch (e) {
+                console.error('[unityDebug] readPlayerPrefs failed', e);
+                return null;
+              }
+            },
+            listIndexedDB: async () => {
+              if (!indexedDB) {
+                console.warn('[unityDebug] indexedDB not available');
+                return [];
+              }
+              if (indexedDB.databases) {
+                const dbs = await indexedDB.databases();
+                console.log('[unityDebug] indexedDB databases', dbs);
+                return dbs;
+              }
+              console.warn('[unityDebug] indexedDB.databases() not supported in this browser');
+              return [];
+            },
+            dumpIndexedDB: async () => {
+              if (!indexedDB) {
+                console.warn('[unityDebug] indexedDB not available');
+                return {};
+              }
+              const mod = window.unityDebug.getModule();
+              const known = [];
+              if (mod && mod.companyName && mod.productName) {
+                known.push(`UnityCache_${mod.companyName}_${mod.productName}`);
+              }
+              known.push('IDBFS', 'UnityCache');
+              if (window.__idbfsDbName) known.push(String(window.__idbfsDbName));
+              let dbs = [];
+              if (indexedDB.databases) {
+                try { dbs = await indexedDB.databases(); } catch (e) {}
+              }
+              const names = Array.from(new Set([
+                ...dbs.map(d => d.name).filter(Boolean),
+                ...known
+              ]));
+              const results = {};
+              const openDb = (name) => new Promise((resolve, reject) => {
+                try {
+                  const req = indexedDB.open(name);
+                  req.onsuccess = () => resolve(req.result);
+                  req.onerror = () => reject(req.error || new Error('open failed'));
+                } catch (e) { reject(e); }
+              });
+              const getAllKeys = (store) => new Promise((resolve, reject) => {
+                try {
+                  if (store.getAllKeys) {
+                    const req = store.getAllKeys();
+                    req.onsuccess = () => resolve(req.result || []);
+                    req.onerror = () => reject(req.error || new Error('getAllKeys failed'));
+                  } else {
+                    const keys = [];
+                    const cursorReq = store.openCursor();
+                    cursorReq.onsuccess = (ev) => {
+                      const cursor = ev.target.result;
+                      if (cursor) { keys.push(cursor.key); cursor.continue(); }
+                      else resolve(keys);
+                    };
+                    cursorReq.onerror = () => reject(cursorReq.error || new Error('cursor failed'));
+                  }
+                } catch (e) { reject(e); }
+              });
+              for (const name of names) {
+                try {
+                  const db = await openDb(name);
+                  const stores = Array.from(db.objectStoreNames || []);
+                  const dbInfo = { stores: {} };
+                  for (const storeName of stores) {
+                    const tx = db.transaction(storeName, 'readonly');
+                    const store = tx.objectStore(storeName);
+                    let keys = [];
+                    try { keys = await getAllKeys(store); }
+                    catch (e) { keys = [`<error: ${e}>`]; }
+                    dbInfo.stores[storeName] = {
+                      keyCount: Array.isArray(keys) ? keys.length : 0,
+                      sampleKeys: Array.isArray(keys) ? keys.slice(0, 20) : []
+                    };
+                  }
+                  results[name] = dbInfo;
+                  db.close();
+                } catch (e) {}
+              }
+              console.log('[unityDebug] indexedDB dump', results);
+              return results;
+            },
+            installFSLogger: (opts = {}) => {
+              const FS = window.unityDebug.getFS();
+              if (!FS) {
+                console.warn('[unityDebug] FS not available yet');
+                return false;
+              }
+              if (FS.__unityFsLoggerInstalled) {
+                console.warn('[unityDebug] FS logger already installed');
+                return true;
+              }
+              try {
+                if (!FS.analyzePath('/idbfs/StreamingAssets').exists) {
+                  FS.mkdir('/idbfs/StreamingAssets');
+                }
+              } catch (e) {}
+
+              const options = {
+                autoSyncOnWrite: true,
+                debounceMs: 500,
+                remapPrefix: '/http:/SaveData',
+                remapTarget: '/idbfs/SaveData',
+                ...opts,
+              };
+              const shouldTracePath = (p) => ENABLE_SAVE_TRACE && typeof p === 'string' && p.includes('/SaveData');
+              const emitSaveTrace = (label, p) => {
+                try {
+                  if (!ENABLE_SAVE_TRACE) return;
+                  console.warn('[saveTrace]', label, p);
+                  const mod = window.unityDebug.getModule();
+                  if (mod && typeof mod.stackTrace === 'function') {
+                    console.warn('[saveTrace] stack', mod.stackTrace());
+                  } else {
+                    console.warn('[saveTrace] stack', (new Error()).stack);
+                  }
+                } catch (e) {}
+              };
+              FS.__unityFsLoggerInstalled = true;
+              FS.__unityFsLoggerOriginals = {
+                open: FS.open, close: FS.close, write: FS.write,
+                writeFile: FS.writeFile, readFile: FS.readFile,
+                stat: FS.stat, lstat: FS.lstat,
+                analyzePath: FS.analyzePath, lookupPath: FS.lookupPath,
+                createPath: FS.createPath, mkdir: FS.mkdir,
+                unlink: FS.unlink, rmdir: FS.rmdir,
+                rename: FS.rename, syncfs: FS.syncfs,
+              };
+              let syncTimer = null;
+              const scheduleSync = () => {
+                if (!options.autoSyncOnWrite) return;
+                if (syncTimer) return;
+                syncTimer = setTimeout(() => {
+                  syncTimer = null;
+                  window.unityDebug.syncPersistent().catch(() => {});
+                }, options.debounceMs);
+              };
+              const normalizePath = (p) => {
+                try {
+                  if (typeof p !== 'string') return p;
+                  if (p.startsWith('http://') || p.startsWith('https://')) {
+                    try { const u = new URL(p); p = u.pathname || p; } catch (e) {}
+                  }
+                  if (p.length > 0 && p[0] !== '/') p = '/' + p;
+                  p = p.replace(/\/{2,}/g, '/');
+                  while (p.includes('/..')) {
+                    p = p.replace(/\/[^\/]+\/\.\.(?=\/|$)/g, '');
+                  }
+                } catch (e) {}
+                return p;
+              };
+              const remapPath = (p) => {
+                try {
+                  if (typeof p !== 'string') return p;
+                  p = normalizePath(p);
+                  if (p.startsWith(options.remapPrefix)) {
+                    return options.remapTarget + p.slice(options.remapPrefix.length);
+                  }
+                  const match = p.match(/\/+SaveData(\/|$)/);
+                  if (match) {
+                    const idx = match.index || 0;
+                    const tail = p.slice(idx + '/SaveData'.length);
+                    return options.remapTarget + tail;
+                  }
+                } catch (e) {}
+                return p;
+              };
+              FS.open = function(path, flags, mode) {
+                const rp = remapPath(path);
+                if (rp !== path) console.log('[unityFS] remap', path, '->', rp);
+                if (shouldTracePath(rp)) {
+                  console.log('[unityFS] open', rp, flags, '0x' + (flags >>> 0).toString(16));
+                } else {
+                  console.log('[unityFS] open', rp, flags);
+                }
+                try {
+                  return FS.__unityFsLoggerOriginals.open.call(this, rp, flags, mode);
+                } catch (e) {
+                  if (shouldTracePath(rp)) {
+                    console.warn('[saveTrace] open failed', rp, 'flags', flags, e);
+                    emitSaveTrace('open-failed', rp);
+                    try {
+                      const dir = rp.replace(/\/[^\/]+$/, '') || '/';
+                      if (!FS.analyzePath(dir).exists) {
+                        if (FS.mkdirTree) FS.mkdirTree(dir);
+                        else FS.mkdir(dir);
+                      }
+                      return FS.__unityFsLoggerOriginals.open.call(this, rp, flags, mode);
+                    } catch (e2) {
+                      console.warn('[saveTrace] open retry failed', rp, e2);
+                    }
+                  }
+                  throw e;
+                }
+              };
+              FS.lookupPath = function(path, opts) {
+                const rp = remapPath(path);
+                if (rp !== path) console.log('[unityFS] remap', path, '->', rp);
+                if (shouldTracePath(rp)) emitSaveTrace('lookupPath', rp);
+                try {
+                  return FS.__unityFsLoggerOriginals.lookupPath.call(this, rp, opts);
+                } catch (e) {
+                  if (shouldTracePath(rp)) console.warn('[saveTrace] lookupPath failed', rp, e && e.errno, e);
+                  throw e;
+                }
+              };
+              FS.analyzePath = function(path, dontResolveLastLink) {
+                const rp = remapPath(path);
+                if (rp !== path) console.log('[unityFS] remap', path, '->', rp);
+                if (shouldTracePath(rp)) emitSaveTrace('analyzePath', rp);
+                try {
+                  return FS.__unityFsLoggerOriginals.analyzePath.call(this, rp, dontResolveLastLink);
+                } catch (e) {
+                  if (shouldTracePath(rp)) console.warn('[saveTrace] analyzePath failed', rp, e && e.errno, e);
+                  throw e;
+                }
+              };
+              FS.stat = function(path) {
+                const rp = remapPath(path);
+                if (rp !== path) console.log('[unityFS] remap', path, '->', rp);
+                if (shouldTracePath(rp)) emitSaveTrace('stat', rp);
+                try {
+                  return FS.__unityFsLoggerOriginals.stat.call(this, rp);
+                } catch (e) {
+                  if (shouldTracePath(rp)) console.warn('[saveTrace] stat failed', rp, e && e.errno, e);
+                  throw e;
+                }
+              };
+              if (FS.lstat) {
+                FS.lstat = function(path) {
+                  const rp = remapPath(path);
+                  if (rp !== path) console.log('[unityFS] remap', path, '->', rp);
+                  if (shouldTracePath(rp)) emitSaveTrace('lstat', rp);
+                  try {
+                    return FS.__unityFsLoggerOriginals.lstat.call(this, rp);
+                  } catch (e) {
+                    if (shouldTracePath(rp)) console.warn('[saveTrace] lstat failed', rp, e && e.errno, e);
+                    throw e;
+                  }
+                };
+              }
+              if (FS.createPath) {
+                FS.createPath = function(parent, path, canRead, canWrite) {
+                  const rp = remapPath(path);
+                  if (rp !== path) console.log('[unityFS] remap', path, '->', rp);
+                  if (shouldTracePath(rp)) emitSaveTrace('createPath', rp);
+                  return FS.__unityFsLoggerOriginals.createPath.call(this, parent, rp, canRead, canWrite);
+                };
+              }
+              FS.close = function(stream) {
+                const result = FS.__unityFsLoggerOriginals.close.apply(this, arguments);
+                try {
+                  if (stream && stream.flags && (stream.flags & 1)) {
+                    console.log('[unityFS] close (write)', stream.path);
+                    scheduleSync();
+                  }
+                } catch (e) {}
+                return result;
+              };
+              FS.write = function(stream, buffer, offset, length, position, canOwn) {
+                const result = FS.__unityFsLoggerOriginals.write.apply(this, arguments);
+                try {
+                  if (stream && stream.path) {
+                    console.log('[unityFS] write', stream.path, length);
+                    if (shouldTracePath(stream.path)) emitSaveTrace('write', stream.path);
+                    scheduleSync();
+                  }
+                } catch (e) {}
+                return result;
+              };
+              FS.writeFile = function(path, data, opts2) {
+                const rp = remapPath(path);
+                if (rp !== path) console.log('[unityFS] remap', path, '->', rp);
+                console.log('[unityFS] writeFile', rp);
+                const result = FS.__unityFsLoggerOriginals.writeFile.call(this, rp, data, opts2);
+                if (shouldTracePath(rp)) emitSaveTrace('writeFile', rp);
+                scheduleSync();
+                return result;
+              };
+              FS.readFile = function(path, opts2) {
+                const rp = remapPath(path);
+                if (rp !== path) console.log('[unityFS] remap', path, '->', rp);
+                console.log('[unityFS] readFile', rp);
+                return FS.__unityFsLoggerOriginals.readFile.call(this, rp, opts2);
+              };
+              FS.mkdir = function(path, mode) {
+                const rp = remapPath(path);
+                if (rp !== path) console.log('[unityFS] remap', path, '->', rp);
+                console.log('[unityFS] mkdir', rp);
+                return FS.__unityFsLoggerOriginals.mkdir.call(this, rp, mode);
+              };
+              FS.unlink = function(path) {
+                const rp = remapPath(path);
+                if (rp !== path) console.log('[unityFS] remap', path, '->', rp);
+                console.log('[unityFS] unlink', rp);
+                const result = FS.__unityFsLoggerOriginals.unlink.call(this, rp);
+                scheduleSync();
+                return result;
+              };
+              FS.rmdir = function(path) {
+                const rp = remapPath(path);
+                if (rp !== path) console.log('[unityFS] remap', path, '->', rp);
+                console.log('[unityFS] rmdir', rp);
+                const result = FS.__unityFsLoggerOriginals.rmdir.call(this, rp);
+                scheduleSync();
+                return result;
+              };
+              FS.rename = function(oldPath, newPath) {
+                const ro = remapPath(oldPath);
+                const rn = remapPath(newPath);
+                if (ro !== oldPath) console.log('[unityFS] remap', oldPath, '->', ro);
+                if (rn !== newPath) console.log('[unityFS] remap', newPath, '->', rn);
+                console.log('[unityFS] rename', ro, '->', rn);
+                const result = FS.__unityFsLoggerOriginals.rename.call(this, ro, rn);
+                scheduleSync();
+                return result;
+              };
+
+              console.log('[unityDebug] FS logger installed');
+
+              // Re-populate IDBFS from IndexedDB immediately after the logger installs.
+              // Safety net: if the defineProperty intercept above fired late and Unity's
+              // initial autoSyncPersistentDataPath already ran against the wrong DB,
+              // this re-sync corrects the in-memory FS state before the game reads saves.
+              if (typeof FS.syncfs === 'function') {
+                console.log('[unityDebug] Re-populating IDBFS from IndexedDB...');
+                FS.syncfs(true, (err) => {
+                  if (err) {
+                    console.error('[unityDebug] Re-populate failed', err);
+                  } else {
+                    console.log('[unityDebug] Re-populate ok — save files now in memory');
+                  }
+                });
+              }
+
+              return true;
+            },
+            installSaveTrace: () => {
+              if (!ENABLE_SAVE_TRACE) return false;
+              const mod = window.unityDebug.getModule();
+              if (!mod) return false;
+              if (mod.__saveTraceInstalled) return true;
+              mod.__saveTraceInstalled = true;
+              const origConsole = window.__saveTraceOrigConsole || {
+                error: console.error.bind(console),
+                warn: console.warn.bind(console),
+                log: console.log.bind(console),
+                group: console.group ? console.group.bind(console) : null,
+                groupEnd: console.groupEnd ? console.groupEnd.bind(console) : null,
+              };
+              window.__saveTraceOrigConsole = origConsole;
+              const shouldTrace = (msg) =>
+                typeof msg === 'string' &&
+                (msg.includes('Failed to save file at path') ||
+                 msg.includes('Error while saving the current game version data'));
+              let lastTraceTs = 0;
+              const shouldEmitNow = () => {
+                const now = Date.now();
+                if (now - lastTraceTs < 1000) return false;
+                lastTraceTs = now;
+                return true;
+              };
+              const emitTrace = (label, msg) => {
+                try {
+                  if (!shouldEmitNow()) return;
+                  if (origConsole.group) origConsole.group(`[saveTrace] ${label}`);
+                  origConsole.error(msg);
+                  if (typeof mod.stackTrace === 'function') {
+                    origConsole.log('[saveTrace] stack', mod.stackTrace());
+                  } else {
+                    origConsole.log('[saveTrace] stack', (new Error()).stack);
+                  }
+                  if (origConsole.groupEnd) origConsole.groupEnd();
+                } catch (e) {}
+              };
+              const origPrint = mod.print ? mod.print.bind(mod) : console.log.bind(console);
+              const origPrintErr = mod.printErr ? mod.printErr.bind(mod) : console.error.bind(console);
+              mod.print = function() {
+                try {
+                  const msg = Array.from(arguments).join(' ');
+                  if (shouldTrace(msg)) emitTrace('print', msg);
+                } catch (e) {}
+                return origPrint.apply(this, arguments);
+              };
+              mod.printErr = function() {
+                try {
+                  const msg = Array.from(arguments).join(' ');
+                  if (shouldTrace(msg)) emitTrace('printErr', msg);
+                } catch (e) {}
+                return origPrintErr.apply(this, arguments);
+              };
+              if (!console.__saveTraceInstalled) {
+                console.__saveTraceInstalled = true;
+                const origErr = origConsole.error;
+                const origWarn = origConsole.warn;
+                console.error = function() {
+                  try {
+                    const msg = Array.from(arguments).join(' ');
+                    if (shouldTrace(msg)) emitTrace('console.error', msg);
+                  } catch (e) {}
+                  return origErr.apply(console, arguments);
+                };
+                console.warn = function() {
+                  try {
+                    const msg = Array.from(arguments).join(' ');
+                    if (shouldTrace(msg)) emitTrace('console.warn', msg);
+                  } catch (e) {}
+                  return origWarn.apply(console, arguments);
+                };
+              }
+              console.log('[unityDebug] save trace installed');
+              return true;
+            }
+          };
+
+          const tryInstallFsLogger = () => window.unityDebug.installFSLogger();
+          if (!tryInstallFsLogger()) {
+            const fsLoggerInterval = setInterval(() => {
+              if (tryInstallFsLogger()) clearInterval(fsLoggerInterval);
+            }, 500);
+          }
+          const tryInstallSaveTrace = () => window.unityDebug.installSaveTrace();
+          if (!tryInstallSaveTrace()) {
+            const saveTraceInterval = setInterval(() => {
+              if (tryInstallSaveTrace()) clearInterval(saveTraceInterval);
+            }, 500);
+          }
+
+          // ─── SAVE DATA NET SHIM ─────────────────────────────────────────────────
+          // Sole handler for SaveData fetch/XHR. waitForFS() prevents the 202 race.
+          (function installSaveDataNetShim() {
+            const normalizePath = (p) => {
+              try {
+                if (typeof p !== 'string') return p;
+                if (p.startsWith('http://') || p.startsWith('https://')) {
+                  try { const u = new URL(p); p = u.pathname || p; } catch (e) {}
+                }
+                if (p.length > 0 && p[0] !== '/') p = '/' + p;
+                p = p.replace(/\/{2,}/g, '/');
+                while (p.includes('/..')) {
+                  p = p.replace(/\/[^\/]+\/\.\.(?=\/|$)/g, '');
+                }
+              } catch (e) {}
+              return p;
+            };
+            const saveDataPathFromUrl = (url) => {
+              const p = normalizePath(String(url || ''));
+              const match = p.match(/\/+SaveData(\/|$)/);
+              if (!match) return null;
+              const idx = match.index || 0;
+              const tail = p.slice(idx + '/SaveData'.length);
+              return '/idbfs/SaveData' + tail;
+            };
+
+            // Polls until FS is available. Never rejects.
+            const waitForFS = () => new Promise((resolve) => {
+              const check = () => {
+                const FS = window.FS ||
+                  (window.unityDebug && window.unityDebug.getFS && window.unityDebug.getFS());
+                if (FS) return resolve(FS);
+                setTimeout(check, 100);
+              };
+              check();
+            });
+
+            let __idbfsPopulatePromise = null;
+            const ensureIdbfsPopulated = (FS) => {
+              if (!FS || typeof FS.syncfs !== 'function') return Promise.resolve();
+              if (__idbfsPopulatePromise) return __idbfsPopulatePromise;
+              __idbfsPopulatePromise = new Promise((resolve) => {
+                try { FS.syncfs(true, () => resolve()); }
+                catch (e) { resolve(); }
+              }).finally(() => { __idbfsPopulatePromise = null; });
+              return __idbfsPopulatePromise;
+            };
+
+            const ensureDir = (FS, path) => {
+              const dir = path.replace(/\/[^\/]+$/, '') || '/';
+              if (!FS.analyzePath(dir).exists) {
+                FS.mkdirTree ? FS.mkdirTree(dir) : FS.mkdir(dir);
+              }
+            };
+
+            const writeFile = async (FS, path, body) => {
+              ensureDir(FS, path);
+              let data = body;
+              if (data == null) data = '';
+              if (data instanceof ArrayBuffer) data = new Uint8Array(data);
+              if (data instanceof Uint8Array) {
+                FS.writeFile(path, data, { encoding: 'binary' });
+              } else if (typeof data === 'string') {
+                FS.writeFile(path, data, { encoding: 'utf8' });
+              } else if (data && data.arrayBuffer) {
+                FS.writeFile(path, new Uint8Array(await data.arrayBuffer()), { encoding: 'binary' });
+              } else {
+                FS.writeFile(path, String(data), { encoding: 'utf8' });
+              }
+            };
+
+            const readFile = async (FS, path) => {
+              if (!FS.analyzePath(path).exists) {
+                await ensureIdbfsPopulated(FS);
+              }
+              if (!FS.analyzePath(path).exists) return null;
+              return FS.readFile(path);
+            };
+
+            // ── fetch shim ──
+            const _fetch = window.fetch ? window.fetch.bind(window) : null;
+            if (_fetch) {
+              window.fetch = async (input, init = {}) => {
+                const url = typeof input === 'string' ? input : (input && input.url) || '';
+                const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+                const savePath = saveDataPathFromUrl(url);
+                if (!savePath) return _fetch(input, init);
+                console.log('[saveShim] fetch', method, url, '->', savePath);
+                try {
+                  const FS = await waitForFS();
+                  if (method === 'GET') {
+                    const data = await readFile(FS, savePath);
+                    if (!data) return new Response('', { status: 404 });
+                    return new Response(data, { status: 200 });
+                  }
+                  if (method === 'POST' || method === 'PUT') {
+                    await writeFile(FS, savePath, init && init.body);
+                    window.unityDebug && window.unityDebug.syncPersistent();
+                    return new Response('', { status: 200 });
+                  }
+                  return new Response('', { status: 405 });
+                } catch (e) {
+                  console.error('[saveShim] fetch error', e);
+                  return new Response(String(e), { status: 500 });
+                }
+              };
+            }
+
+            // ── XHR shim ──
+            const _xhrOpen = XMLHttpRequest.prototype.open;
+            const _xhrSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
+              this.__saveDataUrl = url;
+              this.__saveDataMethod = method;
+              return _xhrOpen.apply(this, arguments);
+            };
+            XMLHttpRequest.prototype.send = function(body) {
+              const savePath = saveDataPathFromUrl(this.__saveDataUrl);
+              if (!savePath) return _xhrSend.apply(this, arguments);
+              const method = (this.__saveDataMethod || 'GET').toUpperCase();
+              console.log('[saveShim] xhr', method, this.__saveDataUrl, '->', savePath);
+              const respond = (status, data) => {
+                try {
+                  Object.defineProperty(this, 'status', { value: status, configurable: true });
+                  Object.defineProperty(this, 'readyState', { value: 4, configurable: true });
+                  Object.defineProperty(this, 'response', { value: data || null, configurable: true });
+                  Object.defineProperty(this, 'responseText', { value: typeof data === 'string' ? data : '', configurable: true });
+                } catch (e) {}
+                if (this.onload) this.onload();
+                if (this.onreadystatechange) this.onreadystatechange();
+              };
+              // Always wait for FS — never give a premature 202
+              waitForFS().then(async (FS) => {
+                try {
+                  if (method === 'GET') {
+                    const data = await readFile(FS, savePath);
+                    if (!data) return respond(404, '');
+                    return respond(200, data);
+                  }
+                  if (method === 'POST' || method === 'PUT') {
+                    await writeFile(FS, savePath, body);
+                    window.unityDebug && window.unityDebug.syncPersistent();
+                    return respond(200, '');
+                  }
+                  respond(405, '');
+                } catch (e) {
+                  console.error('[saveShim] xhr error', e);
+                  if (this.onerror) this.onerror(e);
+                }
+              });
+            };
+
+            console.log('[saveShim] SaveData net shim installed');
+          })();
+          // ─── END SAVE DATA NET SHIM ─────────────────────────────────────────────
+
+          const autoSync = () => {
+            if (window.unityDebug) window.unityDebug.syncPersistent();
+          };
+          window.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') autoSync();
+          });
+          window.addEventListener('pagehide', autoSync);
+        }).catch((message) => {
+          // Silent fail to match minimal template
+        });
+      };
+      document.body.appendChild(script);
+    </script>
+  </body>
+</html> 
